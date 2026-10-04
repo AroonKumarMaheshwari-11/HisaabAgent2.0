@@ -12,7 +12,7 @@ import os
 # Gemini configuration
 # ---------------------------------------------------------------------------
 # Single place to change the model. Do not hard-code model names anywhere else.
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 
 # Resolution order: environment variable first (local dev), then Streamlit
 # secrets (deployed). We don't import streamlit here to keep this module

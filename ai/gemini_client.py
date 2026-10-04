@@ -7,11 +7,23 @@ place.
 import json
 import os
 import time
+import traceback
 from typing import Optional
 
 from config import (
     GEMINI_MODEL, GEMINI_API_KEY_ENV_VAR, GEMINI_MAX_RETRIES,
     GEMINI_TEMPERATURE_EXTRACTION, GEMINI_TEMPERATURE_ANALYSIS,
+)
+
+FRIENDLY_ERROR = (
+    "HisaabAgent couldn't reach the AI service just now. "
+    "Please check your connection and try again."
+)
+
+# Substrings of errors that retrying will never fix.
+_PERMANENT_ERROR_HINTS = (
+    "404", "NOT_FOUND", "400", "INVALID_ARGUMENT",
+    "401", "403", "PERMISSION_DENIED", "API key not valid",
 )
 
 
@@ -53,6 +65,18 @@ def _get_client():
     return genai.Client(api_key=api_key)
 
 
+def _log_error(where: str, error: Exception) -> None:
+    """Prints the real error to the terminal so it can be diagnosed."""
+    print(f"\n[GEMINI ERROR in {where}] model={GEMINI_MODEL}", flush=True)
+    print(f"{type(error).__name__}: {error}", flush=True)
+    traceback.print_exc()
+
+
+def _is_permanent(error: Exception) -> bool:
+    text = f"{type(error).__name__} {error}"
+    return any(hint in text for hint in _PERMANENT_ERROR_HINTS)
+
+
 def generate_json(prompt: str, response_schema: dict, temperature: float = None) -> dict:
     """
     Calls Gemini with a JSON-schema-constrained response. Retries on
@@ -77,24 +101,23 @@ def generate_json(prompt: str, response_schema: dict, temperature: float = None)
                     response_schema=response_schema,
                 ),
             )
-            text = response.text
-            return json.loads(text)
+            return json.loads(response.text)
         except json.JSONDecodeError as e:
             last_error = e
+            _log_error("generate_json (bad JSON)", e)
             time.sleep(0.5)
             continue
         except Exception as e:
             last_error = e
-            # Rate limit / transient network errors: brief backoff and retry.
+            _log_error("generate_json", e)
+            if _is_permanent(e):
+                break
             if attempt < GEMINI_MAX_RETRIES:
                 time.sleep(1.0 * (attempt + 1))
                 continue
             break
 
-    raise GeminiError(
-        "HisaabAgent couldn't reach the AI service just now. "
-        "Please check your connection and try again."
-    ) from last_error
+    raise GeminiError(FRIENDLY_ERROR) from last_error
 
 
 def generate_text(prompt: str, temperature: float = None) -> str:
@@ -115,15 +138,15 @@ def generate_text(prompt: str, temperature: float = None) -> str:
             return (response.text or "").strip()
         except Exception as e:
             last_error = e
+            _log_error("generate_text", e)
+            if _is_permanent(e):
+                break
             if attempt < GEMINI_MAX_RETRIES:
                 time.sleep(1.0 * (attempt + 1))
                 continue
             break
 
-    raise GeminiError(
-        "HisaabAgent couldn't reach the AI service just now. "
-        "Please check your connection and try again."
-    ) from last_error
+    raise GeminiError(FRIENDLY_ERROR) from last_error
 
 
 def is_configured() -> bool:
