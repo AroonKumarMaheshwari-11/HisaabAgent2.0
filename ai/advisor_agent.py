@@ -2,13 +2,18 @@
 Business Advisor: the final reasoning layer. Combines Finance, Inventory,
 and Cash Flow agent outputs into a synthesized recommendation, a prioritized
 action plan, or a direct answer to a free-text question.
+
+Free-text questions are answered agentically: Gemini decides which tools to
+call (data tools and RAG retrieval, see ai/tools.py), while every number
+still comes from deterministic Python.
 """
 
 import re
 
 from ai import finance_agent, inventory_agent, cashflow_agent
-from ai.gemini_client import generate_text, GeminiError
+from ai.gemini_client import generate_text, generate_with_tools, GeminiError
 from ai.prompts import build_advisor_prompt, build_action_plan_prompt, build_advisor_chat_prompt
+from ai.tools import ADVISOR_TOOLS
 from services.analytics_service import build_full_business_context
 
 
@@ -75,7 +80,38 @@ def generate_action_plan(period_key: str = "30d") -> list:
     return parsed
 
 
+AGENT_SYSTEM_PROMPT = (
+    "You are HisaabAgent, a business advisor for a Pakistani micro-business. "
+    "You have tools. Data tools return the business's real numbers; "
+    "search_business_records finds specific customers, products or past "
+    "transactions; search_knowledge_base returns retail best-practice "
+    "passages. Call the tools you need; do not guess. For 'what should I do' "
+    "questions, combine the business's numbers with advice from "
+    "search_knowledge_base and name the topic you used. NEVER calculate or "
+    "estimate numbers yourself: use only figures returned by tools and quote "
+    "them exactly. If the tools return nothing relevant, say 'not enough "
+    "data'. Reply in the same language as the user (English or Roman Urdu). "
+    "Keep the answer short, practical and specific. Amounts are in PKR."
+)
+
+
 def answer_question(user_question: str, period_key: str = "30d") -> str:
+    """Agentic answer: Gemini picks which tools to call. Falls back to the
+    fixed-context prompt if tool calling fails."""
+    try:
+        text, tools_used = generate_with_tools(
+            f"Default period: {period_key}.\nQuestion: {user_question}",
+            tools=ADVISOR_TOOLS,
+            system_instruction=AGENT_SYSTEM_PROMPT,
+        )
+        if text and tools_used:
+            labels = ", ".join(t.replace("_", " ") for t in tools_used)
+            return f"{text}\n\n*Data used: {labels}*"
+        if text:
+            return text
+    except GeminiError:
+        pass  # fall through to the fixed-context path below
+
     context = build_full_business_context(period_key)
     try:
         return generate_text(build_advisor_chat_prompt(user_question, context))

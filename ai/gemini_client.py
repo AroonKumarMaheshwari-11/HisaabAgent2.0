@@ -34,19 +34,31 @@ class GeminiError(Exception):
 
 def _get_api_key() -> Optional[str]:
     """
-    Resolution order: environment variable (local dev) then Streamlit
-    secrets (deployed). Imports streamlit lazily so this module stays
-    importable in non-Streamlit contexts (tests, scripts).
+
+    Resolution order: environment variable, then Streamlit secrets, then
+    .streamlit/secrets.toml read directly (so scripts and tests work too).
     """
+    
     key = os.environ.get(GEMINI_API_KEY_ENV_VAR)
     if key:
-        return key
+        return key.strip()
     try:
         import streamlit as st
-        return st.secrets.get("gemini", {}).get("api_key")
+        key = st.secrets.get("gemini", {}).get("api_key")
+        if key:
+            return key.strip()
+    except Exception:
+        pass
+    try:
+        import tomllib
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            ".streamlit", "secrets.toml")
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        key = data.get("gemini", {}).get("api_key") or data.get("GEMINI_API_KEY")
+        return key.strip() if key else None
     except Exception:
         return None
-
 
 def _get_client():
     api_key = _get_api_key()
@@ -153,3 +165,48 @@ def is_configured() -> bool:
     """Cheap check for whether an API key is present - used for the
     sidebar 'AI Online' indicator without making a real API call each rerun."""
     return _get_api_key() is not None
+
+def generate_with_tools(prompt: str, tools: list, system_instruction: str = None,
+                        temperature: float = None, max_calls: int = 6):
+    """
+    Agentic generation: Gemini may call the given Python functions (tools)
+    in a loop, then writes the final answer. Returns (text, tools_used).
+    """
+    from google.genai import types
+
+    client = _get_client()
+    temp = temperature if temperature is not None else GEMINI_TEMPERATURE_ANALYSIS
+
+    last_error = None
+    for attempt in range(GEMINI_MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=temp,
+                    system_instruction=system_instruction,
+                    tools=tools,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        maximum_remote_calls=max_calls
+                    ),
+                ),
+            )
+            tools_used = []
+            for content in (response.automatic_function_calling_history or []):
+                for part in (content.parts or []):
+                    call = getattr(part, "function_call", None)
+                    if call and call.name and call.name not in tools_used:
+                        tools_used.append(call.name)
+            return (response.text or "").strip(), tools_used
+        except Exception as e:
+            last_error = e
+            _log_error("generate_with_tools", e)
+            if _is_permanent(e):
+                break
+            if attempt < GEMINI_MAX_RETRIES:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            break
+
+    raise GeminiError(FRIENDLY_ERROR) from last_error
